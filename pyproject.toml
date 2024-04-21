@@ -100,8 +100,11 @@ search = [
 ]
 
 
-[tool.poetry.scripts]
-docprompt = 'docprompt.cli:main'
+[tool.poetry.group.dev.dependencies]
+maturin = "^1.5.1"
+
+[tool.poetry.build]
+script = "cargo build --release"
 
 [tool.black]
 line-length = 120
