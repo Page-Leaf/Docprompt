@@ -1,10 +1,12 @@
-from docprompt import load_document
+import pytest
+from docprompt import load_document, load_documents
 from PIL import Image
 import io
 
 from .fixtures import PDF_FIXTURES
 
-from docprompt.utils.splitter import pdf_split_iter_fast
+from docprompt.utils.splitter import pdf_split_iter_fast, pdf_split_iter_with_max_bytes
+from docprompt.utils import is_pdf, hash_from_bytes
 from docprompt.rasterize import ProviderResizeRatios
 
 
@@ -15,12 +17,68 @@ def test_load_document():
         assert doc.document_hash == fixture.file_hash
 
 
+def test_load_document_from_bytes():
+    fixture = PDF_FIXTURES[0]
+
+    with open(fixture.get_full_path(), "rb") as f:
+        doc = load_document(f.read())
+
+    assert doc.page_count == fixture.page_count
+    assert doc.document_hash == fixture.file_hash
+    assert doc.name == f"document-{fixture.file_hash}.pdf"
+
+
+def test_is_pdf():
+    fixture = PDF_FIXTURES[0]
+
+    assert is_pdf(fixture.get_full_path())
+    assert is_pdf(fixture.get_full_path().read_bytes())
+
+
+def test_get_page_count():
+    fixture = PDF_FIXTURES[0]
+
+    assert fixture.page_count == load_document(fixture.get_full_path()).page_count
+    assert (
+        fixture.page_count
+        == load_document(fixture.get_full_path().read_bytes()).page_count
+    )
+
+
+def test_load_documents():
+    fixture = PDF_FIXTURES[0]
+
+    docs = load_documents([fixture.get_full_path()] * 3)
+
+    assert len(docs) == 3
+
+
+def test_hash_from_bytes__large_file():
+    # 200MB file
+
+    random_bytes = b"0" * 1024 * 1024 * 200
+
+    assert hash_from_bytes(random_bytes) == "8a9566fd729cce6410050771422e42b8"
+
+
 def test_rasterize():
     # Fow now just test PIL can open the image
     for fixture in PDF_FIXTURES:
         doc = load_document(fixture.get_full_path())
         img_bytes = doc.rasterize_page(1)
         Image.open(io.BytesIO(img_bytes))
+
+
+def test_rasterize_invalid_page():
+    document = load_document(PDF_FIXTURES[0].get_full_path())
+
+    with pytest.raises(ValueError):
+        document.rasterize_page(0)
+
+    with pytest.raises(ValueError):
+        document.rasterize_page(1000)
+
+    document.rasterize_page(len(document))  # Should rasterize last page
 
 
 def test_rasterize_convert_and_quantize():
@@ -113,11 +171,30 @@ def test_split():
 
     assert len(new_docs) == len(doc) - 2
 
+    new_docs = doc.split(stop=2)
+
+    assert len(new_docs) == 2
+
+    with pytest.raises(ValueError):
+        doc.split()
+
 
 def test_pdf_split_iter_fast_1_sized():
     doc = load_document(PDF_FIXTURES[0].get_full_path())
 
     splits = list(pdf_split_iter_fast(doc.file_bytes, 1))
+
+    assert len(splits) == len(doc)
+
+
+def test_pdf_split_iter_max_bytes():
+    doc = load_document(PDF_FIXTURES[0].get_full_path())
+
+    splits = list(
+        pdf_split_iter_with_max_bytes(
+            doc.file_bytes, max_page_count=1, max_bytes=1024 * 1024
+        )
+    )
 
     assert len(splits) == len(doc)
 

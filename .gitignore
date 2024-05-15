@@ -121,3 +121,4 @@ data/
 # Added by cargo
 
 /target
+.pdm-python

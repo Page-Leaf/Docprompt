@@ -9,13 +9,11 @@ from os import PathLike
 from pathlib import Path
 from typing import Dict, Generator, Optional, Tuple, Union, Iterable
 from pydantic import Field
+import filetype
 
-import magic
-import pypdfium2 as pdfium
 from pydantic import (
     BaseModel,
     PositiveInt,
-    PrivateAttr,
     computed_field,
     field_serializer,
     field_validator,
@@ -26,6 +24,11 @@ from docprompt._exec.ghostscript import (
 )
 from docprompt.rasterize import process_raster_image, ResizeModes, AspectRatioRule
 import logging
+from docprompt._pdfium import (
+    get_pdfium_document,
+    rasterize_page_with_pdfium,
+    rasterize_pdf_with_pdfium,
+)
 
 DEFAULT_DPI = 100
 
@@ -39,18 +42,18 @@ def get_page_render_size_from_bytes(
     Returns the render size of a page in pixels
     """
 
-    pdf = pdfium.PdfDocument(BytesIO(file_bytes))
-    page = pdf.get_page(page_number)
+    with get_pdfium_document(file_bytes) as pdf:
+        page = pdf.get_page(page_number)
 
-    mediabox = page.get_mediabox()
+        mediabox = page.get_mediabox()
 
-    base_width = int(mediabox[2] - mediabox[0])
-    base_height = int(mediabox[3] - mediabox[1])
+        base_width = int(mediabox[2] - mediabox[0])
+        base_height = int(mediabox[3] - mediabox[1])
 
-    width = int(base_width * dpi / 72)
-    height = int(base_height * dpi / 72)
+        width = int(base_width * dpi / 72)
+        height = int(base_height * dpi / 72)
 
-    return width, height
+        return width, height
 
 
 class PdfDocument(BaseModel):
@@ -61,8 +64,6 @@ class PdfDocument(BaseModel):
     name: str = Field(description="The name of the document")
     file_bytes: bytes = Field(description="The bytes of the document", repr=False)
     file_path: Optional[str] = None
-
-    _raster_cache: Dict[int, Dict[int, bytes]] = PrivateAttr(default_factory=dict)
 
     def __len__(self):
         return self.num_pages
@@ -106,13 +107,13 @@ class PdfDocument(BaseModel):
         if len(v) == 0:
             raise ValueError("File bytes must not be empty")
 
-        if magic.from_buffer(v, mime=True) == "text/plain":
+        if filetype.guess_mime(v) == "text/plain":
             v = base64.b64decode(v, validate=True)
 
-        if magic.from_buffer(v, mime=True) == "application/gzip":
+        if filetype.guess_mime(v) == "application/gzip":
             v = gzip.decompress(v)
 
-        if magic.from_buffer(v, mime=True) != "application/pdf":
+        if filetype.guess_mime(v) != "application/pdf":
             raise ValueError("File bytes must be a PDF")
 
         return v
@@ -157,6 +158,21 @@ class PdfDocument(BaseModel):
         with self.as_tempfile() as temp_path:
             return compress_pdf_to_bytes(temp_path, **compression_kwargs)
 
+    def render_page_to_bytes(self, page_number: int, dpi: int = DEFAULT_DPI) -> bytes:
+        if page_number <= 0 or page_number > self.num_pages:
+            raise ValueError(f"Page number must be between 0 and {self.num_pages}")
+
+        bitmap = rasterize_page_with_pdfium(
+            self.file_bytes, page_number, scale=(1 / 72) * dpi
+        )
+        pil = bitmap.to_pil().convert("RGB")
+
+        img_bytes = BytesIO()
+        pil.save(img_bytes, format="PNG")
+        rastered = img_bytes.getvalue()
+
+        return rastered
+
     def rasterize_page(
         self,
         page_number: int,
@@ -166,7 +182,6 @@ class PdfDocument(BaseModel):
         resize_mode: ResizeModes = "thumbnail",
         max_file_size_bytes: Optional[int] = None,
         resize_aspect_ratios: Optional[Iterable[AspectRatioRule]] = None,
-        use_cache: bool = True,
         do_convert: bool = False,
         image_covert_mode: str = "L",
         do_quantize: bool = False,
@@ -175,30 +190,11 @@ class PdfDocument(BaseModel):
         """
         Rasterizes a page of the document using Pdfium
         """
-        generated_image = False
 
         if page_number < 0 or page_number > self.num_pages:
             raise ValueError(f"Page number must be between 0 and {self.num_pages}")
 
-        if use_cache and self._raster_cache.get(dpi, {}).get(page_number):
-            rastered = self._raster_cache[dpi][page_number]
-        else:
-            pdf = pdfium.PdfDocument(BytesIO(self.file_bytes))
-            page = pdf[page_number - 1]
-
-            bitmap = page.render(scale=(1 / 72) * dpi)
-
-            pil = bitmap.to_pil().convert("RGB")
-
-            img_bytes = BytesIO()
-            pil.save(img_bytes, format="PNG")
-            rastered = img_bytes.getvalue()
-
-            generated_image = True
-
-        if use_cache and generated_image:
-            self._raster_cache.setdefault(dpi, {})
-            self._raster_cache[dpi][page_number] = rastered
+        rastered = self.render_page_to_bytes(page_number, dpi=dpi)
 
         rastered = process_raster_image(
             rastered,
@@ -207,7 +203,7 @@ class PdfDocument(BaseModel):
             resize_mode=resize_mode,
             resize_aspect_ratios=resize_aspect_ratios,
             do_convert=do_convert,
-            image_covert_mode=image_covert_mode,
+            image_convert_mode=image_covert_mode,
             do_quantize=do_quantize,
             quantize_color_count=quantize_color_count,
             max_file_size_bytes=max_file_size_bytes,
@@ -224,7 +220,6 @@ class PdfDocument(BaseModel):
         resize_mode: ResizeModes = "thumbnail",
         max_file_size_bytes: Optional[int] = None,
         resize_aspect_ratios: Optional[Iterable[AspectRatioRule]] = None,
-        use_cache: bool = True,
         do_convert: bool = False,
         image_covert_mode: str = "L",
         do_quantize: bool = False,
@@ -238,7 +233,6 @@ class PdfDocument(BaseModel):
             page_number,
             dpi=dpi,
             downscale_size=downscale_size,
-            use_cache=use_cache,
             do_convert=do_convert,
             image_covert_mode=image_covert_mode,
             do_quantize=do_quantize,
@@ -252,27 +246,29 @@ class PdfDocument(BaseModel):
     def rasterize_pdf(
         self,
         dpi: int = DEFAULT_DPI,
-        use_cache: bool = True,
+        max_file_size_bytes: Optional[int] = None,
     ) -> Dict[int, bytes]:
         """
         Rasterizes the entire document using Pdfium
         """
-        if (
-            use_cache
-            and self._raster_cache.get(dpi)
-            and len(self._raster_cache[dpi]) == self.num_pages
-        ):
-            return self._raster_cache[dpi]
 
         result = {}
 
-        for page_number in range(1, self.num_pages + 1):
-            result[page_number] = self.rasterize_page(
-                page_number, dpi=dpi, use_cache=False
+        for idx, bitmap in enumerate(
+            rasterize_pdf_with_pdfium(self.file_bytes, scale=(1 / 72) * dpi)
+        ):
+            pil = bitmap.to_pil().convert("RGB")
+
+            img_bytes = BytesIO()
+            pil.save(img_bytes, format="PNG")
+            rastered = img_bytes.getvalue()
+
+            rastered = process_raster_image(
+                rastered,
+                max_file_size_bytes=max_file_size_bytes,
             )
 
-        if use_cache:
-            self._raster_cache[dpi] = result.copy()  # Shallow copy should be OK
+            result[idx + 1] = rastered
 
         return result
 

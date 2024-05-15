@@ -45,11 +45,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install poetry
+          pip install pdm
+          pdm install -G:all
 
       - name: Build wheels and source tarball
         run: >-
-          poetry build
+          pdm build
 
       - name: show temporary files
         run: >-
