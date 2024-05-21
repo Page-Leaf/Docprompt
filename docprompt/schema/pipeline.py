@@ -1,6 +1,4 @@
 import base64
-from io import BytesIO
-import multiprocessing
 from typing import (
     Any,
     Dict,
@@ -20,11 +18,7 @@ from pydantic import BaseModel, Field, PositiveInt, PrivateAttr
 from docprompt.rasterize import AspectRatioRule, ResizeModes, process_raster_image
 from docprompt.tasks.base import ResultContainer
 from docprompt.tasks.ocr.result import OcrPageResult
-from docprompt._pdfium import rasterize_pdf_with_pdfium
-from multiprocessing import get_context
-from concurrent.futures import ProcessPoolExecutor
 from PIL import Image
-import io
 
 if TYPE_CHECKING:
     from docprompt.provenance.search import DocumentProvenanceLocator
@@ -80,7 +74,7 @@ class PageRasterizer:
                 resize_mode=resize_mode,
                 resize_aspect_ratios=resize_aspect_ratios,
                 do_convert=do_convert,
-                image_covert_mode=image_convert_mode,
+                image_convert_mode=image_convert_mode,
                 do_quantize=do_quantize,
                 quantize_color_count=quantize_color_count,
                 max_file_size_bytes=max_file_size_bytes,
@@ -97,7 +91,7 @@ class PageRasterizer:
                 resize_mode=resize_mode,
                 resize_aspect_ratios=resize_aspect_ratios,
                 do_convert=do_convert,
-                image_covert_mode=image_convert_mode,
+                image_convert_mode=image_convert_mode,
                 do_quantize=do_quantize,
                 quantize_color_count=quantize_color_count,
                 max_file_size_bytes=max_file_size_bytes,
@@ -152,8 +146,8 @@ class PageRasterizer:
         return self.raster_cache.pop(name, default=default)
 
 
-def process_bitmap(
-    image,
+def process_bytes(
+    rastered: bytes,
     *,
     resize_width: Optional[int] = None,
     resize_height: Optional[int] = None,
@@ -165,10 +159,6 @@ def process_bitmap(
     quantize_color_count: int = 8,
     max_file_size_bytes: Optional[int] = None,
 ):
-    img_bytes = BytesIO()
-    image.save(img_bytes, format="PNG")
-    rastered = img_bytes.getvalue()
-
     rastered = process_raster_image(
         rastered,
         resize_width=resize_width,
@@ -203,48 +193,37 @@ class DocumentRasterizer:
         do_quantize: bool = False,
         quantize_color_count: int = 8,
         max_file_size_bytes: Optional[int] = None,
+        render_grayscale: bool = False,
     ) -> List[Union[bytes, Image.Image]]:
-        bitmaps = rasterize_pdf_with_pdfium(
-            self.owner.document.file_bytes, scale=(1 / 72) * dpi
+        images = self.owner.document.rasterize_pdf(
+            dpi=dpi,
+            downscale_size=downscale_size,
+            resize_mode=resize_mode,
+            resize_aspect_ratios=resize_aspect_ratios,
+            do_convert=do_convert,
+            image_convert_mode=image_convert_mode,
+            do_quantize=do_quantize,
+            quantize_color_count=quantize_color_count,
+            max_file_size_bytes=max_file_size_bytes,
+            render_grayscale=render_grayscale,
+            return_mode=return_mode,
         )
 
-        results: List[Union[bytes, Image.Image]] = []
+        for page_number, image in images.items():
+            page_node = self.owner.page_nodes[page_number - 1]
 
-        futures = []
+            page_node._raster_cache[name] = image
 
-        worker_count = min(len(self.owner.page_nodes), multiprocessing.cpu_count() - 1)
+        return list(images.values())
 
-        with ProcessPoolExecutor(
-            max_workers=worker_count, mp_context=get_context("spawn")
-        ) as executor:
-            for bitmap in bitmaps:
-                futures.append(
-                    executor.submit(
-                        process_bitmap,
-                        bitmap.to_pil().convert("RGB"),
-                        resize_width=downscale_size[0] if downscale_size else None,
-                        resize_height=downscale_size[1] if downscale_size else None,
-                        resize_mode=resize_mode,
-                        aspect_ratios=resize_aspect_ratios,
-                        do_convert=do_convert,
-                        image_convert_mode=image_convert_mode,
-                        do_quantize=do_quantize,
-                        quantize_color_count=quantize_color_count,
-                        max_file_size_bytes=max_file_size_bytes,
-                    )
-                )
+    def propagate_cache(self, name: str, rasters: Dict[int, Union[bytes, Image.Image]]):
+        """
+        Should be one-indexed
+        """
+        for page_number, raster in rasters.items():
+            page_node = self.owner.page_nodes[page_number - 1]
 
-        for future, page_node in zip(futures, self.owner.page_nodes):
-            result = future.result()
-
-            page_node._raster_cache[name] = result
-
-            if return_mode == "pil" and isinstance(result, bytes):
-                results.append(Image.open(io.BytesIO(result)))
-            elif return_mode == "bytes" and isinstance(result, bytes):
-                results.append(result)
-
-        return results
+            page_node._raster_cache[name] = raster
 
 
 class PageNode(BaseModel, Generic[PageNodeMetadata]):
