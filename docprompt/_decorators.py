@@ -59,7 +59,21 @@ def flexible_methods(*method_groups: Tuple[str, str]):
 
                     @wraps(async_method)
                     def sync_wrapper(*args, **kwargs):
-                        return asyncio.run(async_method(*args, **kwargs))
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            # No running event loop, create a new one
+                            return asyncio.run(async_method(*args, **kwargs))
+                        else:
+                            # Event loop is already running, use it
+                            if loop.is_running():
+                                return asyncio.create_task(
+                                    async_method(*args, **kwargs)
+                                )
+                            else:
+                                return loop.run_until_complete(
+                                    async_method(*args, **kwargs)
+                                )
 
                     setattr(cls, sync_name, sync_wrapper)
 
